@@ -154,6 +154,10 @@ extern "C" void call_indirect(CPU* c, uint32_t addr) {
         if (canon != addr && (fn = fn_lookup(canon))) { fn(c); return; }
         // In a relocatable module, where the game linked it.
         canon = rels_canon(addr);
+        if (addr == 0x8099E6ACu) {
+            fprintf(stderr, "[REL LOOKUP] runtime=%08X canonical=%08X function=%p", addr, canon, (void*)fn_lookup(canon));
+            fputc(10, stderr);
+        }
         if (canon != addr && (fn = fn_lookup(canon))) { fn(c); return; }
     }
     // GCN_RAM_DUMP=<path>: the guest RAM at this failure, for finding out what the code at

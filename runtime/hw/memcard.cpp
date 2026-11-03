@@ -4,6 +4,9 @@
 #include "memcard.h"
 #include <cstdio>
 #include <ctime>
+#include <cerrno>
+#include <cstring>
+#include <cstdlib>
 
 enum : uint8_t {
     CMD_ID = 0x00, CMD_READ_ARRAY = 0x52, CMD_SET_INT = 0x81, CMD_READ_STATUS = 0x83, CMD_READ_ID = 0x85,
@@ -116,23 +119,30 @@ void MemCard::flush() {
     if (!dirty_) return;
     size_t slash = path_.find_last_of("/\\");
     if (slash != std::string::npos) plat_make_dirs(path_.substr(0, slash));
-    std::string tmp = path_ + ".tmp";
-    if (FILE* f = fopen(tmp.c_str(), "wb")) {
-        fwrite(data_.data(), 1, data_.size(), f);
-        fclose(f);
-        // Windows' rename() fails if the destination exists, so go through the
-        // platform layer, which replaces it.
-        plat_replace_file(tmp.c_str(), path_.c_str());
-        dirty_ = false;
-    } else {
-        // This used to do nothing at all when the path was not writable, which is how an
-        // app with "/" for a working directory came up with a blank card every launch.
-        static bool warned = false;
-        if (!warned) {
-            warned = true;
-            LOG(LOG_EXI, "memcard: cannot write %s -- saves will not persist", tmp.c_str());
-        }
+    const std::string tmp = path_ + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f) {
+        LOG(LOG_EXI, "memcard: cannot open %s for writing: %s", tmp.c_str(), strerror(errno));
+        return;
     }
+    const size_t count = fwrite(data_.data(), 1, data_.size(), f);
+    const int write_error = ferror(f);
+    const int close_error = fclose(f);
+    if (count != data_.size() || write_error || close_error != 0) {
+        LOG(LOG_EXI, "memcard: incomplete write to %s (%zu/%zu bytes); card still dirty",
+            tmp.c_str(), count, data_.size());
+        remove(tmp.c_str());
+        return;
+    }
+    if (!plat_replace_file(tmp.c_str(), path_.c_str())) {
+        LOG(LOG_EXI, "memcard: cannot replace %s from %s: %s; card still dirty",
+            path_.c_str(), tmp.c_str(), strerror(errno));
+        remove(tmp.c_str());
+        return;
+    }
+    dirty_ = false;
+    if (getenv("GCN_CARD_TRACE"))
+        fprintf(stderr, "[CARD] persisted %zu bytes to %s\n", data_.size(), path_.c_str());
 }
 
 void MemCard::select() {
@@ -145,6 +155,10 @@ void MemCard::select() {
 bool MemCard::deselect() {
     bool irq = false;
     if (pos_) LOG(LOG_EXI, "memcard cmd %02X bytes=%u addr=%05X", cmd_, pos_, addr_);
+    if (getenv("GCN_CARD_TRACE") &&
+        (cmd_ == CMD_PAGE_PROGRAM || cmd_ == CMD_SECTOR_ERASE || cmd_ == CMD_CHIP_ERASE))
+        fprintf(stderr, "[CARD] operation=%02X bytes=%u address=%05X program-data=%zu\n",
+                cmd_, pos_, addr_, prog_.size());
     switch (cmd_) {
     case CMD_SECTOR_ERASE:
         if (pos_ >= 3) {

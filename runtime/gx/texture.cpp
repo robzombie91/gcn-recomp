@@ -1,3 +1,4 @@
+#include <cstdio>
 // GX texture decoding (all formats -> RGBA8), TLUT (palette) memory, and the
 // guest-side texture cache.
 #include <algorithm>
@@ -395,11 +396,57 @@ static void efb_copy_palette(const TexParams& p, uint32_t copy_fmt, TexLookup& r
     r.pal_bits = bits;
 }
 
+
+// Temporary Harvest Moon font TMEM diagnostic.
+static std::vector<uint8_t> g_font_preload_snapshot;
+
+void font_preload_probe(uint32_t addr) {
+    if (addr != 0x0100C0E0u || !g_font_preload_snapshot.empty())
+        return;
+
+    constexpr size_t bytes = 326592;
+    const uint8_t* p = phys_ptr(addr);
+    g_font_preload_snapshot.assign(p, p + bytes);
+
+    std::fprintf(stderr,
+        "[FONT PRELOAD] addr=%08X size=%zu first=%02X%02X%02X%02X",
+        addr, bytes, p[0], p[1], p[2], p[3]);
+    std::fputc(10, stderr);
+}
+
+
+// Diagnostic approximation: retain DMA uploads by source address.
+// This does not emulate TMEM replacement or bank selection.
+static std::unordered_map<uint32_t, std::vector<uint8_t>> g_preload_by_source;
+
+void texture_preload_capture(uint32_t addr, uint32_t control) {
+    const uint32_t size = (control & 0x7FFFu) * 32u;
+    if (!size || size > 524288u || addr >= RAM_SIZE ||
+        size > RAM_SIZE - addr)
+        return;
+
+    auto& bytes = g_preload_by_source[addr];
+    const uint8_t* p = phys_ptr(addr);
+    bytes.assign(p, p + size);
+}
+
+static const uint8_t* texture_preload_source(uint32_t addr, uint32_t size) {
+    auto it = g_preload_by_source.find(addr);
+    if (it != g_preload_by_source.end() && it->second.size() >= size)
+        return it->second.data();
+    return phys_ptr(addr);
+}
+
 TexLookup texture_lookup(const TexParams& p, std::vector<std::shared_ptr<TexData>>& new_textures) {
     uint32_t addr = p.addr & 0x03FFFFFF;
     // EFB copies at this address take priority (the copy isn't written back to RAM),
     // unless the RAM there has changed since, which means the copy has been replaced.
-    static const bool hash_always = getenv("GCN_TEXHASH_ALWAYS") != nullptr;
+    // Harvest Moon diagnostic, based on gcn-recomp's per-lookup texture hashing
+    // (originally used to investigate texture changes within a single game frame).
+    // Default to the strict path for this experiment; GCN_TEXHASH_NORMAL=1 restores
+    // the original once-per-frame behaviour for an A/B comparison without rebuilding.
+    // This costs CPU time but does not modify guest texture memory or save data.
+    static const bool hash_always = getenv("GCN_TEXHASH_NORMAL") == nullptr;
     auto eit = g_efb_copies.find(addr);
     if (eit != g_efb_copies.end()) {
         EfbCopyEntry& c = eit->second;
@@ -439,7 +486,22 @@ TexLookup texture_lookup(const TexParams& p, std::vector<std::shared_ptr<TexData
         h = h > 1 ? h / 2 : 1;
     }
     if (addr + total > RAM_SIZE) return {0, false};
-    const uint8_t* src = phys_ptr(addr);
+    const uint8_t* src = texture_preload_source(addr, total);
+    if (addr == 0x0100C0E0u) {
+        static int logged = 0;
+        if (logged++ < 80) {
+            unsigned long long hash =
+                (unsigned long long)hash_bytes(src, total, 0);
+            std::fprintf(stderr,
+                "[FONT RENDER] frame=%llu size=%u hash=%016llX first=",
+                (unsigned long long)g_frame_counter,
+                total, hash);
+            for (int i = 0; i < 16; ++i)
+                std::fprintf(stderr, "%02X", src[i]);
+            std::fputc(10, stderr);
+        }
+    }
+
 
     // The texels are checked once per frame, on the assumption that the game does not
     // rewrite a texture between two draws of the same frame. GCN_TEXHASH_ALWAYS=1 checks

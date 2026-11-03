@@ -182,6 +182,10 @@ uint32_t rels_canon(uint32_t a) {
     int n = g_live_count.load(std::memory_order_acquire);
     for (int i = 0; i < n; i++) {
         const Live& l = g_live[i];
+        if (a == 0x8099E6ACu) {
+            fprintf(stderr, "[REL DEBUG] slot=%d info=%08X base=%08X size=%08X canon=%08X active=%d", i, l.info, l.base, l.size, l.canon, l.size != 0);
+            fputc(10, stderr);
+        }
         if (a - l.base < l.size) return l.canon + (a - l.base);
     }
     return a;

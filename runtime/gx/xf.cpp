@@ -1,3 +1,4 @@
+#include <cstdio>
 // GX front end (runs on the guest thread): vertex decoding, XF (transform, lighting,
 // texgen) on the CPU, primitive assembly, pixel-state snapshots and EFB copies.
 #include "../runtime.h"
@@ -1665,6 +1666,25 @@ void renderer_bp_write(uint32_t reg, uint32_t v) {
         else g_tev_reg[r][half] = v;
         return;
     }
+    
+    if (reg == 0x63) {
+        static unsigned preload_count = 0;
+        if (preload_count++ < 80) {
+            std::fprintf(stderr,
+                "[TMEM CMD] n=%u src=%08X r60=%06X r61=%06X r62=%06X r63=%06X",
+                preload_count,
+                (g_state.bp[0x60] & 0x1FFFFFu) << 5,
+                g_state.bp[0x60],
+                g_state.bp[0x61],
+                g_state.bp[0x62],
+                v);
+            std::fputc(10, stderr);
+        }
+        texture_preload_capture(
+            (g_state.bp[0x60] & 0x1FFFFFu) << 5, v);
+        font_preload_probe((g_state.bp[0x60] & 0x1FFFFFu) << 5);
+        return;
+    }
     if (reg == 0x65) {  // load TLUT
         uint32_t src = (g_state.bp[0x64] & 0x1FFFFF) << 5;
         uint32_t tmem = (v & 0x3FF) << 9;
@@ -1866,6 +1886,10 @@ void renderer_efb_copy(uint32_t dest_addr, bool /*unused*/) {
             const Cmd& cmd = bb.cmds[i];
             if (cmd.type != CmdType::Draw) { fprintf(stderr, "  [%zu] copy/present\n", i); continue; }
             const PixelState& ps = bb.states[cmd.state];
+            if (((ps.bp[0] >> 10) & 15) + 1 >= 3)
+                fprintf(stderr, "[TEV SWAP] F6=%06X F7=%06X F8=%06X F9=%06X FA=%06X FB=%06X\n",
+                        ps.bp[0xF6], ps.bp[0xF7], ps.bp[0xF8],
+                        ps.bp[0xF9], ps.bp[0xFA], ps.bp[0xFB]);
             uint32_t ns = ((ps.bp[0] >> 10) & 15) + 1;
             fprintf(stderr, "  [%zu] draw n=%u stages=%u tex0=%u%s blend=%06X z=%06X pixfmt=%X order0=%06X c0=%06X a0=%06X c1=%06X a1=%06X kc0=%08X/%08X\n", i, cmd.count, ns,
                     ps.tex_id[0], ps.tex_is_efb[0] ? "(efb)" : "", ps.bp[0x41], ps.bp[0x40], ps.bp[0x43], ps.bp[0x28], ps.bp[0xC0], ps.bp[0xC1], ps.bp[0xC2], ps.bp[0xC3],

@@ -313,11 +313,58 @@ static bool g_state_new;  // the state applied for the next draw has not been dr
 // The state applied for the next draw has a program still being built in the background
 // (render_set_async_shaders), so the draw is left out.
 static bool g_draw_skip;
+// Host-side diagnostic only: never changes guest memory, CARD state or GX commands.
+static int g_debug_command = -1;
+static int g_debug_mode = 0;
+static int g_debug_probe_command = -1;
+static int g_debug_probe_map = 0;
+static bool g_debug_probe_enabled = false;
+static bool g_debug_probe_this_draw = false;
+static GLuint g_debug_probe_tex = 0;
+
+static RenderDebugDrawStats g_debug_stats;
+RenderDebugDrawStats render_debug_draw_stats() { return g_debug_stats; }
+static unsigned g_debug_host_swaps = 0;
+void render_debug_note_window_swap() {
+    g_debug_host_swaps++;
+    g_debug_stats.host_swaps = g_debug_host_swaps;
+    g_debug_stats.last_swap_render_frame = g_debug_stats.render_frame;
+}
+
+
+void render_debug_draw_filter(int command_index, int mode) {
+    g_debug_command = command_index;
+    g_debug_mode = mode;
+}
+
+void render_debug_texture_probe(int command_index, int map, bool enabled) {
+    g_debug_probe_command = command_index;
+    g_debug_probe_map = map >= 0 && map < 8 ? map : 0;
+    g_debug_probe_enabled = enabled;
+}
+
+static void debug_init_probe_texture() {
+    if (g_debug_probe_tex) return;
+    GLint saved_active = GL_TEXTURE0, saved_tex = 0;
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &saved_active);
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &saved_tex);
+    glGenTextures(1, &g_debug_probe_tex);
+    glBindTexture(GL_TEXTURE_2D, g_debug_probe_tex);
+    const uint8_t magenta[4] = {255, 0, 255, 255};
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, magenta);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)saved_tex);
+    glActiveTexture((GLenum)saved_active);
+}
 
 // One draw command, from the packed region its texture coordinate count selects.
 static void draw_cmd(const Batch& b, const Cmd& c) {
+    g_debug_stats.reached_draw_cmd++;
     static const GLenum mode[3] = {GL_TRIANGLES, GL_LINES, GL_POINTS};
     if (g_draw_skip) {
+        g_debug_stats.async_skips++;
         g_stall.waited++;
         return;
     }
@@ -325,6 +372,7 @@ static void draw_cmd(const Batch& b, const Cmd& c) {
     const void* first = (const void*)(uintptr_t)(c.first * sizeof(uint32_t));
     const bool timed = g_state_new;
     const auto t0 = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    g_debug_stats.gl_submissions++;
     if (g_base_vertex) glDrawElementsBaseVertex(mode[c.prim], c.count, GL_UNSIGNED_INT, first, c.base_vertex);
     else glDrawElements(mode[c.prim], c.count, GL_UNSIGNED_INT, first);
     if (timed) {
@@ -1311,8 +1359,10 @@ static void upload_texture(const TexData& t, bool from_pbo = false, size_t pbo_o
     g.levels = (uint32_t)t.levels.size();
     g.last_used = g_render_frame;
     g_textures[t.id] = g;
-    // GCN_TEXDUMP=<dir> writes every texture's top level as <dir>/tex_<id>.png, alpha
-    // forced opaque, so a decoded texture can be looked at apart from the draw using it.
+    // GCN_TEXDUMP=<dir>: preserve the original RGB-only view for compatibility,
+    // and save an additional alpha-preserving RGBA view. PNG viewers often display
+    // transparent pixels as a checkerboard, so inspect both images explicitly.
+    // EFB copies use a separate path (GCN_COPYDUMP).
     static const char* dump = getenv("GCN_TEXDUMP");
     if (dump) {
         std::vector<uint8_t> px((size_t)t.width * t.height * 4);
@@ -1321,6 +1371,8 @@ static void upload_texture(const TexData& t, bool from_pbo = false, size_t pbo_o
         char path[512];
         snprintf(path, sizeof(path), "%s/tex_%u.png", dump, t.id);
         write_png(path, px.data(), (int)t.width, (int)t.height);
+        snprintf(path, sizeof(path), "%s/tex_%u_rgba.png", dump, t.id);
+        write_png(path, reinterpret_cast<const uint8_t*>(t.levels[0].data()), (int)t.width, (int)t.height);
     }
 }
 
@@ -2299,13 +2351,16 @@ static void apply_state(const PixelState& st, int prim) {
                 id = 0;
             }
         }
-        const bool tex_held = g_applied.valid && g_applied.tex_id[m] == id && g_applied.tex_sub[m] == sub;
+        const bool probe = g_debug_probe_this_draw && m == g_debug_probe_map && id != 0;
+        if (probe) debug_init_probe_texture();
+        const bool tex_held = !probe && g_applied.valid && g_applied.tex_id[m] == id && g_applied.tex_sub[m] == sub;
         const bool samp_held = g_applied.valid && g_applied.sampler[m] == sampler;
         if (tex_held && samp_held) continue;
         glActiveTexture(GL_TEXTURE0 + m);
         if (!tex_held) {
             g_astat.texbind++;
-            if (sub) glBindTexture(GL_TEXTURE_2D, eye_grab_for(id).tex);
+            if (probe) glBindTexture(GL_TEXTURE_2D, g_debug_probe_tex);
+            else if (sub) glBindTexture(GL_TEXTURE_2D, eye_grab_for(id).tex);
             else glBindTexture(GL_TEXTURE_2D, gt ? gt->tex : 0);
             g_applied.tex_id[m] = id;
             g_applied.tex_sub[m] = sub;
@@ -2559,7 +2614,69 @@ static void copy_writeback(const EfbCopyCmd& c) {
     copy_writeback_done(c.writeback_ticket, std::move(encoded));
 }
 
+
+
+// A single F7 request captures the scene EFB just before it is copied for display,
+// then the actual default window framebuffer just before the GX overlay is rendered.
+static bool g_frame_capture_pending = false;
+static bool g_frame_capture_efb_done = false;
+static uint32_t g_frame_capture_id = 0;
+static int g_frame_capture_mode = 0;
+static unsigned g_frame_capture_gl_errors = 0;
+
+void render_debug_request_frame_capture() {
+    g_frame_capture_pending = true;
+    g_frame_capture_efb_done = false;
+    g_frame_capture_mode = g_debug_mode;
+}
+
+static bool debug_capture_fbo_png(const char* path, GLuint fbo, int width, int height) {
+    if (width <= 0 || height <= 0 || width > 8192 || height > 8192) return false;
+    GLint saved_read_fbo = 0, saved_pack = 4, saved_read_buffer = GL_BACK;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &saved_read_fbo);
+    glGetIntegerv(GL_PACK_ALIGNMENT, &saved_pack);
+    glGetIntegerv(GL_READ_BUFFER, &saved_read_buffer);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+    glReadBuffer(fbo ? GL_COLOR_ATTACHMENT0 : GL_BACK);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    std::vector<uint8_t> pixels((size_t)width * height * 4);
+    glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    const GLenum err = glGetError();
+    glPixelStorei(GL_PACK_ALIGNMENT, saved_pack);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)saved_read_fbo);
+    glReadBuffer((GLenum)saved_read_buffer);
+    if (err != GL_NO_ERROR) {
+        fprintf(stderr, "[GX CAPTURE] GL error 0x%X reading %s\n", (unsigned)err, path);
+        g_frame_capture_gl_errors++;
+        return false;
+    }
+    // OpenGL readback starts at bottom-left. png.cpp expects top-down RGBA.
+    const size_t pitch = (size_t)width * 4;
+    std::vector<uint8_t> flipped(pixels.size());
+    for (int y = 0; y < height; y++)
+        memcpy(flipped.data() + (size_t)y * pitch,
+               pixels.data() + (size_t)(height - y - 1) * pitch, pitch);
+    return write_png(path, flipped.data(), width, height);
+}
+
+void render_debug_capture_window_before_overlay(int width, int height) {
+    if (!g_frame_capture_pending || !g_frame_capture_efb_done) return;
+    char path[256];
+    snprintf(path, sizeof(path), "saves/gx-capture-%06u-mode%d-window.png",
+             g_frame_capture_id, g_frame_capture_mode);
+    // The desktop loop has rebound GL_FRAMEBUFFER=0 before calling this.
+    const bool ok = debug_capture_fbo_png(path, 0, width, height);
+    fprintf(stderr, "[GX CAPTURE] window %s: %s\n", ok ? "saved" : "FAILED", path);
+    g_frame_capture_pending = false;
+    g_frame_capture_efb_done = false;
+}
+
 static void do_efb_copy(const EfbCopyCmd& c) {
+
+    g_debug_stats.efb_copies++;
+    if (c.to_xfb) g_debug_stats.display_copies++;
+    if (c.clear && (c.clear_color || c.clear_alpha)) g_debug_stats.efb_color_clears++;
+    if (c.clear && c.clear_z) g_debug_stats.efb_depth_clears++;
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_BLEND);
     set_logic_op_off();
@@ -2650,6 +2767,18 @@ static void do_efb_copy(const EfbCopyCmd& c) {
         glBindFramebuffer(GL_FRAMEBUFFER, g_efb_fbo);
         glBindVertexArray(g_vao);
     }
+    // Display-copy clear happens after GX draws. Capture BEFORE that clear,
+    // otherwise the EFB image would misleadingly contain the clear color.
+    if (c.to_xfb && g_frame_capture_pending && !g_frame_capture_efb_done) {
+        g_frame_capture_id = g_present_count + 1;
+        char path[256];
+        snprintf(path, sizeof(path), "saves/gx-capture-%06u-mode%d-efb.png",
+                 g_frame_capture_id, g_frame_capture_mode);
+        const bool ok = debug_capture_fbo_png(path, g_efb_fbo, EFB_W * g_scale, EFB_H * g_scale);
+        g_frame_capture_efb_done = ok;
+        fprintf(stderr, "[GX CAPTURE] EFB %s: %s\n", ok ? "saved" : "FAILED", path);
+        if (!ok) g_frame_capture_pending = false;
+    }
     if (c.clear) {
         glBindFramebuffer(GL_FRAMEBUFFER, g_efb_fbo);
         glEnable(GL_SCISSOR_TEST);
@@ -2700,6 +2829,8 @@ static void blit_to_output(const EfbCopyCmd& c, GLuint src_tex) {
     blit_rect_to_output(src_tex, EFB_W, EFB_H, c.src_x, c.src_y, c.src_w, c.src_h);
 }
 static void blit_rect_to_output(GLuint src_tex, uint32_t tex_w, uint32_t tex_h, uint32_t rx, uint32_t ry, uint32_t rw, uint32_t rh) {
+    g_debug_stats.output_blits++;
+    g_debug_stats.output_clears++;
     glBindFramebuffer(GL_FRAMEBUFFER, g_output_fbo);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_BLEND);
@@ -2794,6 +2925,7 @@ static void dump_xfb(const Xfb& x, uint32_t w) {
 static Xfb* xfb_write(const EfbCopyCmd& c) {
     uint32_t h = vi_display_height();
     if (!h || c.dst_h >= h) return nullptr;  // the copy is the whole frame: present it as such
+    g_debug_stats.xfb_partial++;
     uint32_t stride = c.dst_w * 2;
     Xfb& x = xfb_for(c.dest, c.dst_w, stride, h);
     uint32_t row0 = (c.dest - x.base) / stride;
@@ -2806,12 +2938,14 @@ static Xfb* xfb_write(const EfbCopyCmd& c) {
     for (uint32_t r = row0; r < row0 + rows; r++)
         if (!x.written[r]) { x.written[r] = 1; x.written_rows++; }
     if (x.written_rows < h) return nullptr;
+    g_debug_stats.xfb_completed++;
     std::fill(x.written.begin(), x.written.end(), 0);
     x.written_rows = 0;
     return &x;
 }
 
 static void present(const EfbCopyCmd& c) {
+    g_debug_stats.present_calls++;
     // A copy that is part of a frame: into the XFB, and nothing to show unless it was the
     // last part.
     Xfb* xfb = nullptr;
@@ -4136,6 +4270,18 @@ static void upload_textures(const Batch& b) {
 // `again` draws a batch this function has just drawn: the textures and vertices are
 // already up, and it is the same frame to the texture cache.
 static bool execute_batch(Batch& b, bool do_present, const std::vector<uint8_t>* leave_out, bool again) {
+    // Counters are sampled by F8 after rendering; reset only for the primary pass.
+    if (!again) {
+        g_debug_stats = {};
+        g_debug_stats.selected_command = g_debug_command;
+        g_debug_stats.mode = g_debug_mode;
+        g_debug_stats.render_frame = g_render_frame + 1;
+        g_debug_stats.host_swaps = g_debug_host_swaps;
+        g_debug_stats.last_swap_render_frame = g_render_frame;
+        g_debug_stats.present_count_before = g_present_count;
+        g_debug_stats.efb_fbo = g_efb_fbo;
+        g_debug_stats.output_fbo = g_output_fbo;
+    }
     const auto t_start = std::chrono::steady_clock::now();
     double ms_tex = 0.0, ms_vbo = 0.0, ms_copy = 0.0;
     if (!again) {
@@ -4215,6 +4361,22 @@ static bool execute_batch(Batch& b, bool do_present, const std::vector<uint8_t>*
         Cmd& c = b.cmds[ci];
         switch (c.type) {
         case CmdType::Draw: {
+            g_debug_stats.total_draws++;
+            if ((int)ci == g_debug_command) g_debug_stats.selected_matches++;
+            // Isolate the *command* selected in the overlay, not the draw counter:
+            // offscreen passes and EFB copies remain in the batch and their order is
+            // unchanged. A skipped draw still keeps its texture residency alive.
+            if (g_debug_mode && g_debug_command >= 0) {
+                const bool chosen = ci == (size_t)g_debug_command;
+                const bool skip_debug = (g_debug_mode == 1 && chosen) ||
+                    (g_debug_mode == 2 && !chosen) ||
+                    (g_debug_mode == 3 && chosen && ((g_present_count / 15) & 1));
+                if (skip_debug) {
+                    g_debug_stats.filtered_draws++;
+                    touch_textures(b.states[c.state]);
+                    break;
+                }
+            }
             if (!g_hide.empty() && g_hide[ci]) {
                 // Not drawn, but still the game's: its textures must not age out. The game
                 // goes on referencing them, so it never sends them again, and a hidden
@@ -4425,7 +4587,11 @@ static bool execute_batch(Batch& b, bool do_present, const std::vector<uint8_t>*
             // culled or not: a game draws one it culls to set the plane.
             const bool zfreeze = (b.states[c.state].bp[0x00] >> 19) & 1;
             if (!zfreeze) zfreeze_plane(b, c, g_zplane);
-            if (c.state != cur_state || c.prim != cur_prim) {
+            const bool probe_draw = g_debug_probe_enabled && (int)ci == g_debug_probe_command &&
+                                    b.states[c.state].tex_id[g_debug_probe_map] != 0;
+            if (probe_draw) gl_state_invalidate();
+            g_debug_probe_this_draw = probe_draw;
+            if (c.state != cur_state || c.prim != cur_prim || probe_draw) {
                 apply_state(b.states[c.state], c.prim);
                 cur_state = c.state;
                 cur_prim = c.prim;
@@ -4434,6 +4600,12 @@ static bool execute_batch(Batch& b, bool do_present, const std::vector<uint8_t>*
                 glUniform4fv(g_applied.pr->u_zplane, 1, g_zplane);
             }
             draw_cmd(b, c);
+            if (probe_draw) {
+                g_debug_probe_this_draw = false;
+                gl_state_invalidate();  // force the following draw to restore actual GX textures
+                cur_state = -1;
+                cur_prim = -1;
+            }
             // GCN_PIXEL=x,y[;x,y...] (EFB pixels) with GCN_DRAWLOG=<frame>: after every draw
             // of that frame, each listed pixel is read back and printed when it changed,
             // with the draw's index in the draw log. Which draws touch a pixel, and what
@@ -4490,6 +4662,7 @@ static bool execute_batch(Batch& b, bool do_present, const std::vector<uint8_t>*
             break;
         }
         case CmdType::Present:
+            g_debug_stats.present_commands++;
             if (do_present) present(c.copy);
             presented = true;
             glBindFramebuffer(GL_FRAMEBUFFER, g_efb_fbo);
@@ -4503,6 +4676,7 @@ static bool execute_batch(Batch& b, bool do_present, const std::vector<uint8_t>*
         fprintf(stderr, "[rt] f%u render %6.2fms (tex %5.2f vbo %5.2f copies %5.2f)  applies %4u  programs %zu\n",
                 g_render_frame, ms_since(t_start), ms_tex, ms_vbo, ms_copy, n_apply, g_programs.size());
     apply_stats_flush("flat", g_render_frame);
+    g_debug_stats.present_count_after = g_present_count;
     return presented;
 }
 

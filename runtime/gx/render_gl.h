@@ -13,6 +13,38 @@ constexpr int kMaxInternalScale = 8;
 // render_init; nullptr (the default) builds every shader on first use.
 void render_set_shader_cache(const char* path);
 void render_init(int internal_scale);
+// Optional developer-only draw isolation, indexed by command position in the CURRENT
+// batch (not the frame count or a GL draw ID). mode: 0 normal, 1 hide,
+// 2 selected only, 3 blink selected. Applies to the flat renderer only.
+void render_debug_draw_filter(int command_index, int mode);
+// Optional host-only texture probe: replaces ONE map of ONE selected flat draw
+// with solid magenta (no changes to guest textures or game memory).
+void render_debug_texture_probe(int command_index, int map, bool enabled);
+
+// Counters from the most recently executed flat GX batch. No game-state writes.
+struct RenderDebugDrawStats {
+    unsigned total_draws = 0, selected_matches = 0, filtered_draws = 0;
+    unsigned reached_draw_cmd = 0, gl_submissions = 0, async_skips = 0;
+    int selected_command = -1, mode = 0;
+    unsigned render_frame = 0;
+    unsigned efb_copies = 0, display_copies = 0;
+    unsigned efb_color_clears = 0, efb_depth_clears = 0;
+    unsigned present_commands = 0, present_calls = 0;
+    unsigned xfb_partial = 0, xfb_completed = 0;
+    unsigned output_blits = 0, output_clears = 0;
+    unsigned host_swaps = 0, last_swap_render_frame = 0;
+    unsigned present_count_before = 0, present_count_after = 0;
+    unsigned efb_fbo = 0, output_fbo = 0;
+};
+// Called by desktop window loop after SDL_GL_SwapWindow, no GL calls.
+void render_debug_note_window_swap();
+RenderDebugDrawStats render_debug_draw_stats();
+// F7: take a paired EFB + window screenshot for one presented frame.
+// Must be called on the GL/main thread. Captures do not modify GX state.
+void render_debug_request_frame_capture();
+void render_debug_capture_window_before_overlay(int width, int height);
+
+
 
 // Building a large cache takes a while -- after a change to the shaders every program is
 // compiled again, 6,000 of them in 25 s on a Quest 3 -- and a frontend that must keep

@@ -7,6 +7,7 @@
 #include "input_map.h"
 #include "gx/render_gl.h"
 #include "gx/gl.h"
+#include "gx/gx_debug_overlay.h"
 #include "hw/pad.h"
 #include "vr_game.h"
 #include "telemetry.h"
@@ -225,6 +226,7 @@ static bool pump_events() {
     bool running = true;
     while (SDL_PollEvent(&e)) {
         input_map_event(e);
+        if (gx_debug::handle_event(e)) continue;
         if (e.type == SDL_QUIT) running = false;
         // A device controls.txt binds is the file's alone.
         else if (e.type == SDL_CONTROLLERDEVICEADDED && !g_ctrl && !input_map_binds_index(e.cdevice.which))
@@ -428,6 +430,9 @@ int main(int argc, char** argv) {
         gx::render_set_window_size(dw, dh);
         auto b = gx::take_batch(4);
         if (!b) continue;
+        gx_debug::capture(*b);
+        // Isolation takes effect during the execute immediately below. The filter
+        // is disabled while the snapshot is frozen to prevent stale command IDs.
         // GCN_STEREOLOG=1: what the game's stereo hook (vr_game.h) would have a headset
         // show, whenever the answer changes, numbered as the frame dumps are.
         static const bool stereolog = getenv("GCN_STEREOLOG") != nullptr;
@@ -476,7 +481,10 @@ int main(int argc, char** argv) {
                 SDL_GL_GetDrawableSize(win, &rw, &rh);
                 record::frame(0, rw, rh);
             }
+            if (!g_eye_mode) gx::render_debug_capture_window_before_overlay(dw, dh);
+            if (!g_eye_mode) gx_debug::draw(dw, dh);
             SDL_GL_SwapWindow(win);
+            gx::render_debug_note_window_swap();
             frames++;
             auto now = std::chrono::steady_clock::now();
             double secs = std::chrono::duration<double>(now - t0).count();
