@@ -78,12 +78,13 @@ struct UniformShadow {
     uint32_t screen_uv;
     float ripple[2];
     float tsz[16];
+    float tcs[16];             // per-texcoord SU_SSIZE/TSIZE scale
     uint32_t texsnap;
 };
 
 struct Program {
     GLuint prog;
-    GLint u_proj, u_vp_a, u_vp_b, u_point_size, u_tex, u_reg, u_kstage, u_texsize, u_indmtx, u_indscale,
+    GLint u_proj, u_vp_a, u_vp_b, u_point_size, u_tex, u_reg, u_kstage, u_texsize, u_tcscale, u_indmtx, u_indscale,
         u_alpharef, u_fog, u_fogmode, u_fogcolor, u_indcoordscale, u_texsnap, u_zbias, u_zplane, u_dstalpha;
     GLint u_vr, u_view, u_crop, u_zproj, u_screen_uv, u_screen_px, u_screen_ripple, u_uvgrad;
     GLint u_points, u_point_off;
@@ -428,7 +429,7 @@ static std::unordered_map<uint32_t, GlTex> g_textures;
 // them continuously, and without this both the GL objects and the decoded copies grow
 // without bound until the device runs out of memory and crawls.
 static uint32_t g_render_frame;
-static std::unordered_map<uint32_t, GLuint> g_samplers;
+static std::unordered_map<uint64_t, GLuint> g_samplers;  // by get_sampler's key
 static int g_win_w, g_win_h;
 bool g_cull_swap = false;
 
@@ -628,6 +629,7 @@ static const Program& register_program(const ShaderKey& k, GLuint p) {
     pr.u_reg = glGetUniformLocation(p, "u_reg");
     pr.u_kstage = glGetUniformLocation(p, "u_kstage");
     pr.u_texsize = glGetUniformLocation(p, "u_texsize");
+    pr.u_tcscale = glGetUniformLocation(p, "u_tcscale");
     pr.u_indmtx = glGetUniformLocation(p, "u_indmtx");
     pr.u_indscale = glGetUniformLocation(p, "u_indscale");
     pr.u_alpharef = glGetUniformLocation(p, "u_alpharef");
@@ -1377,7 +1379,14 @@ static void upload_texture(const TexData& t, bool from_pbo = false, size_t pbo_o
 }
 
 static GLuint get_sampler(uint32_t mode0, uint32_t mode1, uint32_t levels) {
-    uint32_t key = (mode0 & 0x3FFFFF) ^ (mode1 << 22) ^ (levels << 30);
+    // Every input the sampler is built from, packed without overlap: mode0's 22 bits,
+    // mode1's min/max LOD (16 bits), and whether the texture has mips at all (all that
+    // `levels` decides below). The key was once 32 bits of XORed fields, which dropped
+    // mode1's upper max_lod bits and wrapped `levels` mod 4: a texture with five mip levels
+    // and max_lod 4.0 then shared the sampler of a one-level texture with max_lod 0 (an
+    // EFB copy, say) and was drawn from level 0 alone, with no mip filter, at any distance.
+    const uint64_t key = (uint64_t)(mode0 & 0x3FFFFF) | (uint64_t)(mode1 & 0xFFFF) << 22 |
+                         (uint64_t)(levels > 1) << 38;
     auto it = g_samplers.find(key);
     if (it != g_samplers.end()) return it->second;
     GLuint s;
@@ -2397,6 +2406,17 @@ static void apply_state(const PixelState& st, int prim) {
         g_astat.tsz++;
         glUniform2fv(pr.u_texsize, 8, tsz);
         memcpy(u.tsz, tsz, sizeof(tsz));
+    }
+    {   // GX texture-coordinate scale: bp[0x30+2c] / bp[0x31+2c], low 16 bits = scale - 1
+        float tcs[16];
+        for (int c = 0; c < 8; c++) {
+            tcs[c * 2] = (float)((bp[0x30 + 2 * c] & 0xFFFF) + 1);
+            tcs[c * 2 + 1] = (float)((bp[0x31 + 2 * c] & 0xFFFF) + 1);
+        }
+        if (!(held && memcmp(tcs, u.tcs, sizeof(tcs)) == 0)) {
+            glUniform2fv(pr.u_tcscale, 8, tcs);
+            memcpy(u.tcs, tcs, sizeof(tcs));
+        }
     }
     if (!(held && u.texsnap == texsnap)) {
         glUniform1i(pr.u_texsnap, (GLint)texsnap);

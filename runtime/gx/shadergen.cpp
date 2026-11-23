@@ -444,6 +444,7 @@ std::string gen_pixel_shader(const ShaderKey& k) {
     s += "uniform ivec4 u_reg[4];\n";
     s += "uniform ivec4 u_kstage[16];\n";  // the konstant each stage selects (kcsel, kasel)
     s += "uniform vec2 u_texsize[8];\n";
+    s += "uniform vec2 u_tcscale[8];\n";  // SU_SSIZE/TSIZE scale per texcoord (see render_gl.cpp)
     s += "uniform ivec3 u_indmtx[6];\n";  // 3 matrices x 2 rows (11-bit signed entries)
     s += "uniform int u_indscale[3];\n";
     s += "uniform ivec2 u_alpharef;\n";
@@ -531,7 +532,11 @@ std::string gen_pixel_shader(const ShaderKey& k) {
         const bool subst = (k.efb_tex_mask >> map) & 1;
         const uint32_t cbit = 1u << coord;
         // ---- indirect texture offset ----
-        W("    vec2 tc = %s%u * u_texsize[%u];\n", subst ? "suv" : "uv", coord, map);
+        // The coordinate is scaled by its texgen's SU_SSIZE/TSIZE scale (what the game sets with
+        // GXSetTexCoordScaleManually; GXLoadTexObj otherwise sets it to the texture's size). A
+        // substituted eye grab keeps the texture-size scale: its coordinate is a screen position.
+        if (subst) W("    vec2 tc = suv%u * u_texsize[%u];\n", coord, map);
+        else W("    vec2 tc = uv%u * u_tcscale[%u];\n", coord, coord);
         uint32_t bt = ind & 3, fmt = (ind >> 2) & 3, bias = (ind >> 4) & 7, bs = (ind >> 7) & 3, mid = (ind >> 9) & 15;
         uint32_t sw = (ind >> 13) & 7, tw = (ind >> 16) & 7;
         bool fb = (ind >> 20) & 1;
