@@ -45,6 +45,9 @@ uint32_t boot_load(const char* iso_path) {
     // BI2 at the very top, FST just below it (what the apploader does).
     uint32_t bi2_addr = 0x817FE000;
     iso_read(0x440, mem_ptr(bi2_addr), 0x2000);
+    // A retail IPL passes no argument list. Some discs' BI2 carries leftover devkit args (ArgOffset @+8), and the
+    // C runtime start then moves arenaHi up to that list, above the FST, so the OS arena clear wipes the FST.
+    if (!getenv("GCN_BI2_KEEP_ARGS")) mem_w32(bi2_addr + 8, 0);
     mem_w32(0x800000F4, bi2_addr);
     uint32_t fst_addr = (bi2_addr - fst_max) & ~0x1Fu;
     iso_read(fst_off, mem_ptr(fst_addr), fst_size);
